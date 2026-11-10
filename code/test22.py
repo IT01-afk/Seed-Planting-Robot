@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+
+import time
+import sys
+import threading
+import glob
+import RPi.GPIO as GPIO
+import pygame
+from evdev import InputDevice, categorize, ecodes
+
+# ========================
+# I2C SETUP (ADS1115 ADC)
+# ========================
+
+import smbus2
+import struct
+
+I2C_BUS = 1
+ADC_ADDR = 0x48
+
+bus = smbus2.SMBus(I2C_BUS)
+
+CONFIG_REG = 0x01
+CONVERSION_REG = 0x00
+
+def read_ads1115():
+    try:
+        # Configure ADS1115:
+        # Single-shot mode
+        # A0 single-ended
+        # ±4.096V range
+        # 128 SPS
+        config = 0xC183
+
+        bus.write_i2c_block_data(
+            ADC_ADDR,
+            CONFIG_REG,
+            [(config >> 8) & 0xFF, config & 0xFF]
+        )
+
+        time.sleep(0.1)
+
+        data = bus.read_i2c_block_data(ADC_ADDR, CONVERSION_REG, 2)
+
+        raw = struct.unpack('>h', bytes(data))[0]
+
+        return raw
+
+    except Exception as e:
+        print("❌ ADC read error:", e)
+        return None
+
+
+def read_soil_moisture():
+    value = read_ads1115()
+
+    if value is None:
+        print("❌ Soil moisture sensor not detected")
+        return None
+
+    voltage = value * 4.096 / 32768.0
+
+    print("🌱 Moisture Reading:")
+    print("Raw ADC:", value)
+    print("Voltage:", round(voltage, 3), "V")
+
+    return value
+
+
+# ============================================================================
+# GPIO CONFIG (BCM)
+# ============================================================================
+
+PUMP_IN1 = 19
+PUMP_IN2 = 26
+PUMP_ENA = 21
+
+MOTOR_A_IN3 = 22
+MOTOR_A_IN4 = 23
+MOTOR_A_ENB = 13
+
+MOTOR_B_IN1 = 17
+MOTOR_B_IN2 = 27
+MOTOR_B_ENA = 12
+
+SERVO_A = 5
+SERVO_B = 6
+SERVO_C = 18
+
+SERVO_MIN = 2.5
+SERVO_MID = 7.5
+SERVO_MAX = 12.5
+
+# ============================================================================
+# ESC LISTENER
+# ============================================================================
+
+class EscListener:
+    def __init__(self):
+        self.escape_pressed = False
+        self.device = None
+
+        for path in glob.glob('/dev/input/event*'):
+            try:
+                dev = InputDevice(path)
+                if "kbd" in dev.name.lower():
+                    self.device = InputDevice(path)
+                    break
+            except:
+                pass
+
+        if self.device:
+            thread = threading.Thread(target=self._listen, daemon=True)
+            thread.start()
+
+    def _listen(self):
+        for event in self.device.read_loop():
+            if event.type == ecodes.EV_KEY:
+                key = categorize(event)
+                if key.keycode == "KEY_ESC" and key.keystate == 1:
+                    print("⏹ ESC pressed — stopping robot")
+                    self.escape_pressed = True
+                    break
+
+# ============================================================================
+# ROBOT CLASS
+# ============================================================================
+
+class SeedPlantingRobot:
+
+    def __init__(self):
+        self.running = False
+        self.controller = None
+
+    # --------------------------------------------------------------
+
+    def setup_gpio(self):
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setwarnings(False)
+
+        for pin in [
+            PUMP_IN1, PUMP_IN2, PUMP_ENA,
+            MOTOR_A_IN3, MOTOR_A_IN4, MOTOR_A_ENB,
+            MOTOR_B_IN1, MOTOR_B_IN2, MOTOR_B_ENA
+        ]:
+            GPIO.setup(pin, GPIO.OUT)
+            GPIO.output(pin, GPIO.LOW)
+
+        GPIO.setup(SERVO_A, GPIO.OUT)
+        GPIO.setup(SERVO_B, GPIO.OUT)
+        GPIO.setup(SERVO_C, GPIO.OUT)
+
+        self.motor_a_pwm = GPIO.PWM(MOTOR_A_ENB, 1000)
+        self.motor_b_pwm = GPIO.PWM(MOTOR_B_ENA, 1000)
+        self.pump_pwm = GPIO.PWM(PUMP_ENA, 1000)
+
+        self.motor_a_pwm.start(0)
+        self.motor_b_pwm.start(0)
+        self.pump_pwm.start(0)
+
+        self.servo_a_pwm = GPIO.PWM(SERVO_A, 50)
+        self.servo_b_pwm = GPIO.PWM(SERVO_B, 50)
+        self.servo_c_pwm = GPIO.PWM(SERVO_C, 50)
+
+    # --------------------------------------------------------------
+
+    def detect_controller(self):
+        pygame.init()
+        pygame.joystick.init()
+
+        if pygame.joystick.get_count() == 0:
+            print("❌ No controller detected")
+            return False
+
+        self.controller = pygame.joystick.Joystick(0)
+        self.controller.init()
+        print("🎮 Controller:", self.controller.get_name())
+        return True
+
+    # --------------------------------------------------------------
+
+    def servo_move(self, pwm, pin, duty):
+        pwm.start(duty)
+        time.sleep(0.3)
+        pwm.ChangeDutyCycle(0)
+        GPIO.output(pin, GPIO.LOW)
+
+    # ================= ROUTINES =================
+
+    def full_moisture_routine(self):
+        print("🌱 Moisture routine")
+
+        # Lower probe
+        self.servo_move(self.servo_a_pwm, SERVO_A, SERVO_MAX)
+
+        # Read moisture AFTER probe down
+        value = read_soil_moisture()
+
+        # Return probe
+        self.servo_move(self.servo_a_pwm, SERVO_A, SERVO_MID)
+
+    def seed_cycle(self):
+        print("🌾 Seed drop")
+        self.servo_move(self.servo_c_pwm, SERVO_C, SERVO_MAX)
+        self.servo_move(self.servo_c_pwm, SERVO_C, SERVO_MIN)
+        self.servo_move(self.servo_c_pwm, SERVO_C, SERVO_MID)
+
+    def water_once(self):
+        print("💧 Watering")
+        GPIO.output(PUMP_IN1, GPIO.HIGH)
+        GPIO.output(PUMP_IN2, GPIO.LOW)
+        self.pump_pwm.ChangeDutyCycle(100)
+        time.sleep(1)
+        self.pump_pwm.ChangeDutyCycle(0)
+        GPIO.output(PUMP_IN1, GPIO.LOW)
+
+    # ================= MOTOR CONTROL =================
+
+    def drive_left_motor(self, speed):
+        if speed > 0:
+            GPIO.output(MOTOR_A_IN3, GPIO.HIGH)
+            GPIO.output(MOTOR_A_IN4, GPIO.LOW)
+        elif speed < 0:
+            GPIO.output(MOTOR_A_IN3, GPIO.LOW)
+            GPIO.output(MOTOR_A_IN4, GPIO.HIGH)
+        else:
+            GPIO.output(MOTOR_A_IN3, GPIO.LOW)
+            GPIO.output(MOTOR_A_IN4, GPIO.LOW)
+
+        self.motor_a_pwm.ChangeDutyCycle(min(abs(speed), 100))
+
+    def drive_right_motor(self, speed):
+        if speed > 0:
+            GPIO.output(MOTOR_B_IN1, GPIO.HIGH)
+            GPIO.output(MOTOR_B_IN2, GPIO.LOW)
+        elif speed < 0:
+            GPIO.output(MOTOR_B_IN1, GPIO.LOW)
+            GPIO.output(MOTOR_B_IN2, GPIO.HIGH)
+        else:
+            GPIO.output(MOTOR_B_IN1, GPIO.LOW)
+            GPIO.output(MOTOR_B_IN2, GPIO.LOW)
+
+        self.motor_b_pwm.ChangeDutyCycle(min(abs(speed), 100))
+
+    # ================= CONTROLLER =================
+
+    def process_controller_input(self):
+
+        pygame.event.pump()
+
+        left_raw = self.controller.get_axis(1)
+        right_raw = self.controller.get_axis(3)
+
+        if abs(left_raw) < 0.2:
+            left_raw = 0
+        if abs(right_raw) < 0.2:
+            right_raw = 0
+
+        self.drive_left_motor(int(-left_raw * 100))
+        self.drive_right_motor(int(-right_raw * 100))
+
+        # A → Moisture
+        if self.controller.get_button(0):
+            self.full_moisture_routine()
+
+        # B → Seed
+        if self.controller.get_button(1):
+            self.seed_cycle()
+
+        # X → Water
+        if self.controller.get_button(3):
+            self.water_once()
+
+    # ================= MAIN LOOP =================
+
+    def run(self):
+        self.running = True
+        esc = EscListener()
+        clock = pygame.time.Clock()
+
+        while self.running:
+            if esc.escape_pressed:
+                break
+
+            self.process_controller_input()
+            clock.tick(60)
+
+        self.shutdown()
+
+    def shutdown(self):
+        print("🔌 Shutting down")
+        self.motor_a_pwm.ChangeDutyCycle(0)
+        self.motor_b_pwm.ChangeDutyCycle(0)
+        self.pump_pwm.ChangeDutyCycle(0)
+        GPIO.cleanup()
+        pygame.quit()
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    robot = SeedPlantingRobot()
+    robot.setup_gpio()
+
+    if not robot.detect_controller():
+        GPIO.cleanup()
+        sys.exit(1)
+
+    robot.run()
+
+if __name__ == "__main__":
+    main()
