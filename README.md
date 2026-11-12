@@ -2,6 +2,10 @@
 
 A tank-tread robot that tests the soil, plants seed and waters it, built for my A-level Product Design NEA (2025–26). It runs on a Raspberry Pi 3B, and all of its control code is written in Python.
 
+**Winner of Best Innovation at the TeenTech Awards 2026.**
+
+Project page and portfolio: **https://ishanththangella.vercel.app/projects/seed-planting-robot.html**
+
 ![The robot on a school field](docs/images/robot-field.jpg)
 
 ## The problem
